@@ -55,16 +55,16 @@ def load_functions_and_prompt(functions_definition, prompts):
     
     try:
         with open(functions_definition, "r", encoding="utf-8") as function_file:
-            raw_json_function = json.load(function_file)
-            # print("printing raw_json_function:",raw_json_function)
-            object_function_definition = [FunctionDefinition(**item) for item in raw_json_function]
+            raw_json_into_function_dict = json.load(function_file)
+            # print("printing raw_json_into_dict:",raw_json_into_dict)
+            object_function_definition = [FunctionDefinition(**item) for item in raw_json_into_function_dict]
             print("object function defination:", object_function_definition)
-    #     with open(prompts, "r", encoding="utf-8") as prompts_file:
-    #         raw_json_prompt = json.load(prompts_file)
-    #         object_prompts = [Prompt()]
+        with open(prompts, "r", encoding="utf-8") as prompts_file:
+            raw_json_into_prompt_dict = json.load(prompts_file)
+            object_prompts = [Prompt(**item) for item in raw_json_into_prompt_dict]
     except Exception as e:
         raise RuntimeError("Error with file", e)
-    return object_function_definition
+    return object_function_definition, object_prompts
 
 if __name__ == "__main__":
     try:
