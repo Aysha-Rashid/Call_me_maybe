@@ -5,7 +5,7 @@ run:
 	uv run python -m src \
 	--input data/input/function_calling_tests.json \
 	--functions_definition data/input/functions_definition.json \
-	--output data/output/function_calls.json
+	--output data/output/function_calling_results.json
 
 debug:
 	uv run python -m pdb -c continue -m src

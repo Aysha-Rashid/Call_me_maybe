@@ -2,8 +2,10 @@ import numpy as np
 from llm_sdk import Small_LLM_Model
 import argparse
 from typing import List, Dict, Any
-from .schema import FunctionDefinition, Prompt, JSONStructure
+from .schema import FunctionDefinition, Prompt, JSONStructure, GenerationState
 import json
+import os
+from pathlib import Path
 
 
 def parse_arg() -> argparse.Namespace:
@@ -21,14 +23,14 @@ def parse_arg() -> argparse.Namespace:
                         help="It is the path to the json file containing \
                         functions_definition used for function calling")
     parser.add_argument('--output',
-                        default="../data/output/function_calls.json",
+                        default="../data/output/function_calling_results.json",
                         type=str,
                         help="It is the path to the json file containing \
                         the result of the program")
     return parser.parse_args()
 
 
-def load_func_and_prompt(functions_definition, prompts):
+def load_func_and_prompt(functions_definition, prompts) -> tuple[list[FunctionDefinition], list[Prompt]]:
     try:
         with open(functions_definition, "r", encoding="utf-8")\
                     as function_file:
@@ -55,25 +57,53 @@ def load_inverted_tokens(model: Small_LLM_Model) -> Dict[int, str]:
             token_id in raw_json_vocab.items()}
 
 
-def adding_constraint(current_str: str, logits: List[float],
-                      vocab_map: Dict[int, str],
-                      schema: JSONStructure) -> np.ndarray:
+def adding_constraint(
+    current_str: str,
+    logits: List[float],
+    vocab_map: Dict[int, str],
+    schema: JSONStructure,
+    suffix_ids: List[int],
+) -> np.ndarray:
+    """Apply function-name and structural token constraints."""
+
     masked_logits = np.array(logits, dtype=np.float32)
-    if len(current_str.strip()) == 0:
-        for token_id, token_str in vocab_map.items():
-            if not token_str.startswith("{") and token_str != "{":
-                masked_logits[token_id] = -float('inf')
-        return masked_logits
-    if '"name": "' in current_str and schema.selected_function is None:
-        valid_names = schema.valid_function_names
-        # print("-----checking valid_names------", valid_names)
-        for token_id, token_str in vocab_map.items():
-            clean_token = token_str.replace('"', '').strip()
-            if clean_token and not any(name.startswith(clean_token)
-                                       for name in valid_names):
-                masked_logits[token_id] = -float('inf')
-            # else:
-            #     print("correct clean_token:", clean_token)
+    name_prefix = '"name": "'
+
+    # ---------------------------------------------------------
+    # Stage 1: Constrain the function name
+    # ---------------------------------------------------------
+    if (name_prefix in current_str and 
+        schema.selected_function is None):
+        partial_name = current_str.split(name_prefix)[-1]
+
+        # Check whether a valid function name is complete.
+        for name in schema.valid_function_names:
+            if partial_name == name + '"':
+                schema.selected_function = name
+                schema.state = GenerationState.AFTER_FUNCTION_NAME
+                break
+        # Restrict the next token to valid name continuations.
+        if schema.selected_function is None:
+            valid_indices = []
+            for token_id, token_str in vocab_map.items():
+                candidate = partial_name + token_str
+                if any((name + '"').startswith(candidate)
+                    for name in schema.valid_function_names):
+                    valid_indices.append(token_id)
+            if valid_indices:
+                mask = np.full_like(masked_logits, -float("inf"),)
+                mask[valid_indices] = masked_logits[valid_indices]
+                return mask
+            raise ValueError(
+                f"No valid continuation for function name: "
+                f"{partial_name!r}"
+            )
+
+    # ---------------------------------------------------------
+    # Stage 2: Force the fixed JSON suffix
+    # ---------------------------------------------------------
+    if schema.state == GenerationState.PARAMETERS_OBJECT:
+        pass
     return masked_logits
 
 
@@ -84,39 +114,75 @@ def decode_constraint(prompt_obj: Prompt,
     state_json = JSONStructure(functions)
     func_descriptions = "\n".join([f"- {f.name}: \
                         {f.description}" for f in functions])
+    prefix_str = ("{\n"
+                 f'  "prompt": {json.dumps(prompt_obj.prompt)},\n'
+                 '  "name": "')
     system_prompt = (
-        f"Available Functions:\n{func_descriptions}\n\n"
-        f"User Task: Translate the prompt into JSON.\n"
-        f"User Prompt: {prompt_obj.prompt}\n"
-        f"JSON Output:\n{{\n  \"prompt\": \
-        \"{prompt_obj.prompt}\",\n  \"name\": \""
+        "Available Functions:\n"
+        f"{func_descriptions}\n\n"
+        "User Task: Translate the prompt into JSON.\n"
+        f"User Prompt: {prompt_obj.prompt}\n\n"
+        "JSON Output:\n"
+        f"{prefix_str}"
     )
+    suffix = (
+                '",\n'
+                '  "parameters": {\n'
+                "  }\n"
+                "}"
+            )
+    suffix_ids = model.encode(suffix)[0].tolist()
     input_id = model.encode(system_prompt)[0].tolist()
     generated_id: List[int] = []
-    prefix_str = f'{{\n  "prompt": "{prompt_obj.prompt}",\n  "name": "'
     for _ in range(120):
-        current_str = prefix_str + (model.decode(generated_id)
-                                    if generated_id else "")
-        logits = model.get_logits_from_input_ids(input_id + generated_id)
-        masked_logits = adding_constraint(current_str, logits,
-                                          vocab_map, state_json)
-        # print(masked_logits)
+        current_str = (
+            prefix_str
+            + (
+                model.decode(generated_id)
+                if generated_id
+                else ""
+            )
+        )
+
+        logits = model.get_logits_from_input_ids(
+            input_id + generated_id
+        )
+
+        masked_logits = adding_constraint(
+            current_str=current_str,
+            logits=logits,
+            vocab_map=vocab_map,
+            schema=state_json,
+            suffix_ids=suffix_ids,
+        )
+
+        if not np.isfinite(masked_logits).any():
+            raise ValueError(
+                "No valid token available for current state"
+            )
+
         next_token_id = int(np.argmax(masked_logits))
         generated_id.append(next_token_id)
-        full_decoded = prefix_str + model.decode(generated_id)
-        if full_decoded.endswith("}") and \
-           full_decoded.count("{") == full_decoded.count("}"):
-            break
-    raw_json = prefix_str + full_decoded
+
+        full_decoded = (
+            prefix_str + model.decode(generated_id)
+        )
+
+        print(
+            f"Generated token: {next_token_id}, "
+            f"Text: {repr(model.decode(generated_id))}"
+        )
+
+        # if state_json.suffix_position >= len(suffix_ids):
+        #     break
+    raw_json = full_decoded
+    print("checking raw_json:",raw_json)
     try:
         return json.loads(raw_json)
-    except Exception as e:
-        print("exception caught:", e)
-        return {
-            "prompt": prompt_obj.prompt,
-            "name": state_json.selected_function or "None",
-            "parameters": {}
-        }
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Generated output is not valid JSON"
+        ) from exc
 
 
 if __name__ == "__main__":
@@ -126,6 +192,8 @@ if __name__ == "__main__":
         functions, prompts = load_func_and_prompt(args.functions_definition,
                                                   args.input)
         vocab_map = load_inverted_tokens(model)
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         results: List[Dict[str, Any]] = []
         for each_prompt in prompts:
             result_dict = decode_constraint(each_prompt, vocab_map,
@@ -133,6 +201,7 @@ if __name__ == "__main__":
             results.append(result_dict)
             print(f"Generated Result for \
                 '{each_prompt.prompt}':\n{result_dict}\n")
+            break # testing: remove this later
         with open(args.output, "w", encoding="utf-8") as out_file:
             json.dump(results, out_file, indent=2)
             print(f"Successfully saved output to {args.output}")

@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from typing import Dict, List, Set, Any
+from enum import Enum
 
 
 class ParameterSchema(BaseModel):
@@ -29,11 +30,24 @@ class FunctionCallResult(BaseModel):
     parameters: Dict[str, Any]
 
 
+class GenerationState(Enum):
+    FUNCTION_NAME = "function_name"
+    AFTER_FUNCTION_NAME = "after_function_name"
+    PARAMETERS_OBJECT = "parameters_object"
+    END = "end"
+
+
 class JSONStructure:
     def __init__(self, functions: List[FunctionDefinition]):
         self.functions = functions
-        self.valid_function_names: Set[str] = {f.name for f in functions}
+        self.valid_function_names: Set[str] = {
+            f.name for f in functions
+        }
         self.param_keys_by_func: Dict[str, Set[str]] = {
-            f.name: set(f.parameters.keys()) for f in functions
+            f.name: set(f.parameters.keys())
+            for f in functions
         }
         self.selected_function: str | None = None
+        # self.suffix_position: int = 0
+        self.current_parameter: str | None = None
+        self.state = GenerationState.FUNCTION_NAME
